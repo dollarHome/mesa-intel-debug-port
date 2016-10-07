@@ -21,13 +21,21 @@
 
 BUILT_SOURCES += $(GENXML_GENERATED_FILES)
 
-SUFFIXES = _pack.h .xml
+SUFFIXES = _pack.h _xml.h .xml
 
 $(GENXML_GENERATED_FILES): genxml/gen_pack_header.py
 
 .xml_pack.h:
 	$(MKDIR_GEN)
 	$(PYTHON_GEN) $(srcdir)/genxml/gen_pack_header.py $< > $@
+
+%_xml.h:  %.xml
+	$(MKDIR_GEN)
+	$(AM_V_GEN) echo -n "static const uint8_t " > $@; \
+	echo -n `basename $@` | sed -e 's,_xml.h,,' >> $@; \
+	echo "_xml[] = {" >> $@; \
+	cat $< | $(XXD) -i >> $@; \
+	echo "};" >> $@
 
 EXTRA_DIST += \
 	genxml/gen4.xml \

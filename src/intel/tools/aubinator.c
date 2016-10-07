@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <getopt.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -807,7 +808,7 @@ handle_trace_block(struct gen_spec *spec, uint32_t *p)
       if (address_space != AUB_TRACE_MEMTYPE_GTT)
          break;
       if (gtt_size < offset + size) {
-         fprintf(stderr, "overflow gtt space: %s", strerror(errno));
+         fprintf(stderr, "overflow gtt space: %s\n", strerror(errno));
          exit(EXIT_FAILURE);
       }
       memcpy((char *) gtt + offset, data, size);
@@ -834,48 +835,51 @@ handle_trace_block(struct gen_spec *spec, uint32_t *p)
 }
 
 struct aub_file {
-   char *filename;
-   int fd;
-   struct stat sb;
+   FILE *stream;
+
    uint32_t *map, *end, *cursor;
+   uint32_t *mem_end;
 };
 
 static struct aub_file *
 aub_file_open(const char *filename)
 {
    struct aub_file *file;
+   struct stat sb;
+   int fd;
 
-   file = malloc(sizeof *file);
-   file->filename = strdup(filename);
-   file->fd = open(file->filename, O_RDONLY);
-   if (file->fd == -1) {
-      fprintf(stderr, "open %s failed: %s", file->filename, strerror(errno));
+   file = calloc(1, sizeof *file);
+   fd = open(filename, O_RDONLY);
+   if (fd == -1) {
+      fprintf(stderr, "open %s failed: %s\n", filename, strerror(errno));
       exit(EXIT_FAILURE);
    }
 
-   if (fstat(file->fd, &file->sb) == -1) {
-      fprintf(stderr, "stat failed: %s", strerror(errno));
+   if (fstat(fd, &sb) == -1) {
+      fprintf(stderr, "stat failed: %s\n", strerror(errno));
       exit(EXIT_FAILURE);
    }
 
-   file->map = mmap(NULL, file->sb.st_size,
-                    PROT_READ, MAP_SHARED, file->fd, 0);
+   file->map = mmap(NULL, sb.st_size,
+                    PROT_READ, MAP_SHARED, fd, 0);
    if (file->map == MAP_FAILED) {
-      fprintf(stderr, "mmap failed: %s", strerror(errno));
+      fprintf(stderr, "mmap failed: %s\n", strerror(errno));
       exit(EXIT_FAILURE);
    }
 
    file->cursor = file->map;
-   file->end = file->map + file->sb.st_size / 4;
+   file->end = file->map + sb.st_size / 4;
 
-   /* mmap a terabyte for our gtt space. */
-   gtt_size = 1ul << 40;
-   gtt = mmap(NULL, gtt_size, PROT_READ | PROT_WRITE,
-              MAP_PRIVATE | MAP_ANONYMOUS |  MAP_NORESERVE, -1, 0);
-   if (gtt == MAP_FAILED) {
-      fprintf(stderr, "failed to alloc gtt space: %s", strerror(errno));
-      exit(1);
-   }
+   return file;
+}
+
+static struct aub_file *
+aub_file_stdin(void)
+{
+   struct aub_file *file;
+
+   file = calloc(1, sizeof *file);
+   file->stream = stdin;
 
    return file;
 }
@@ -925,11 +929,20 @@ struct {
    { "bxt", MAKE_GEN(9, 0) }
 };
 
-static void
+enum {
+   AUB_ITEM_DECODE_OK,
+   AUB_ITEM_DECODE_FAILED,
+   AUB_ITEM_DECODE_NEED_MORE_DATA,
+};
+
+static int
 aub_file_decode_batch(struct aub_file *file, struct gen_spec *spec)
 {
-   uint32_t *p, h, device, data_type;
+   uint32_t *p, h, device, data_type, *new_cursor;
    int header_length, payload_size, bias;
+
+   if (file->end - file->cursor < 12)
+      return AUB_ITEM_DECODE_NEED_MORE_DATA;
 
    p = file->cursor;
    h = *p;
@@ -946,8 +959,7 @@ aub_file_decode_batch(struct aub_file *file, struct gen_spec *spec)
       printf("unknown opcode %d at %td/%td\n",
              OPCODE(h), file->cursor - file->map,
              file->end - file->map);
-      file->cursor = file->end;
-      return;
+      return AUB_ITEM_DECODE_FAILED;
    }
 
    payload_size = 0;
@@ -959,9 +971,22 @@ aub_file_decode_batch(struct aub_file *file, struct gen_spec *spec)
       payload_size = p[4];
       handle_trace_block(spec, p);
       break;
+   default:
+      break;
+   }
+
+   new_cursor = p + header_length + bias + payload_size / 4;
+   if (new_cursor > file->end)
+      return AUB_ITEM_DECODE_NEED_MORE_DATA;
+
+   switch (h & 0xffff0000) {
+   case MAKE_HEADER(TYPE_AUB, OPCODE_AUB, SUBOPCODE_HEADER):
+      break;
+   case MAKE_HEADER(TYPE_AUB, OPCODE_AUB, SUBOPCODE_BLOCK):
+      handle_trace_block(spec, p);
+      break;
    case MAKE_HEADER(TYPE_AUB, OPCODE_AUB, SUBOPCODE_BMP):
       break;
-
    case MAKE_HEADER(TYPE_AUB, OPCODE_NEW_AUB, SUBOPCODE_VERSION):
       printf("version block: dw1 %08x\n", p[1]);
       device = (p[1] >> 8) & 0xff;
@@ -987,13 +1012,57 @@ aub_file_decode_batch(struct aub_file *file, struct gen_spec *spec)
              "subopcode=0x%x (%08x)\n", TYPE(h), OPCODE(h), SUBOPCODE(h), h);
       break;
    }
-   file->cursor = p + header_length + bias + payload_size / 4;
+   file->cursor = new_cursor;
+
+   return AUB_ITEM_DECODE_OK;
 }
 
 static int
 aub_file_more_stuff(struct aub_file *file)
 {
-   return file->cursor < file->end;
+   return file->cursor < file->end || (file->stream && !feof(file->stream));
+}
+
+#define AUB_READ_BUFFER_SIZE (4096)
+#define MAX(a, b) ((a) < (b) ? (b) : (a))
+
+static void
+aub_file_data_grow(struct aub_file *file)
+{
+   size_t old_size = (file->mem_end - file->map) * 4;
+   size_t new_size = MAX(old_size * 2, AUB_READ_BUFFER_SIZE);
+   uint32_t *new_start = realloc(file->map, new_size);
+
+   file->cursor = new_start + (file->cursor - file->map);
+   file->end = new_start + (file->end - file->map);
+   file->map = new_start;
+   file->mem_end = file->map + (new_size / 4);
+}
+
+static bool
+aub_file_data_load(struct aub_file *file)
+{
+   size_t r;
+
+   if (file->stream == NULL)
+      return false;
+
+   /* First remove any consumed data */
+   if (file->cursor > file->map) {
+      memmove(file->map, file->cursor,
+              (file->end - file->cursor) * 4);
+      file->end -= file->cursor - file->map;
+      file->cursor = file->map;
+   }
+
+   /* Then load some new data in */
+   if ((file->mem_end - file->end) < (AUB_READ_BUFFER_SIZE / 4))
+      aub_file_data_grow(file);
+
+   r = fread(file->end, 1, (file->mem_end - file->end) * 4, file->stream);
+   file->end += r / 4;
+
+   return r != 0;
 }
 
 static void
@@ -1027,8 +1096,8 @@ static void
 print_help(const char *progname, FILE *file)
 {
    fprintf(file,
-           "Usage: %s [OPTION]... FILE\n"
-           "Decode aub file contents.\n\n"
+           "Usage: %s [OPTION]... [FILE]\n"
+           "Decode aub file contents from either FILE or the standard input.\n\n"
            "A valid --gen option must be provided.\n\n"
            "      --help          display this help and exit\n"
            "      --gen=platform  decode for given platform (ivb, byt, hsw, bdw, chv, skl, kbl or bxt)\n"
@@ -1036,98 +1105,77 @@ print_help(const char *progname, FILE *file)
            "      --color[=WHEN]  colorize the output; WHEN can be 'auto' (default\n"
            "                        if omitted), 'always', or 'never'\n"
            "      --no-pager      don't launch pager\n"
-           "      --no-offsets    don't print instruction offsets\n",
+           "      --no-offsets    don't print instruction offsets\n"
+           "      --xml=DIR       load hardware xml description from directory DIR\n",
            progname);
-}
-
-static bool
-is_prefix(const char *arg, const char *prefix, const char **value)
-{
-   int l = strlen(prefix);
-
-   if (strncmp(arg, prefix, l) == 0 && (arg[l] == '\0' || arg[l] == '=')) {
-      if (arg[l] == '=')
-         *value = arg + l + 1;
-      else
-         *value = NULL;
-
-      return true;
-   }
-
-   return false;
 }
 
 int main(int argc, char *argv[])
 {
    struct gen_spec *spec;
    struct aub_file *file;
-   int i;
-   bool found_arg_gen = false, pager = true;
-   const char *value, *input_file;
-   char gen_file[256], gen_val[24];
+   int c, i;
+   bool help = false, pager = true;
+   char *input_file = NULL, *xml_path = NULL;
+   char gen_val[24];
    const struct {
       const char *name;
       int pci_id;
-      int major;
-      int minor;
    } gens[] = {
-      { "ivb", 0x0166, 7, 0 }, /* Intel(R) Ivybridge Mobile GT2 */
-      { "hsw", 0x0416, 7, 5 }, /* Intel(R) Haswell Mobile GT2 */
-      { "byt", 0x0155, 7, 5 }, /* Intel(R) Bay Trail */
-      { "bdw", 0x1616, 8, 0 }, /* Intel(R) HD Graphics 5500 (Broadwell GT2) */
-      { "chv", 0x22B3, 8, 0 }, /* Intel(R) HD Graphics (Cherryview) */
-      { "skl", 0x1912, 9, 0 }, /* Intel(R) HD Graphics 530 (Skylake GT2) */
-      { "kbl", 0x591D, 9, 0 }, /* Intel(R) Kabylake GT2 */
-      { "bxt", 0x0A84, 9, 0 }  /* Intel(R) HD Graphics (Broxton) */
+      { "ivb", 0x0166 }, /* Intel(R) Ivybridge Mobile GT2 */
+      { "hsw", 0x0416 }, /* Intel(R) Haswell Mobile GT2 */
+      { "byt", 0x0155 }, /* Intel(R) Bay Trail */
+      { "bdw", 0x1616 }, /* Intel(R) HD Graphics 5500 (Broadwell GT2) */
+      { "chv", 0x22B3 }, /* Intel(R) HD Graphics (Cherryview) */
+      { "skl", 0x1912 }, /* Intel(R) HD Graphics 530 (Skylake GT2) */
+      { "kbl", 0x591D }, /* Intel(R) Kabylake GT2 */
+      { "bxt", 0x0A84 }  /* Intel(R) HD Graphics (Broxton) */
    }, *gen = NULL;
+   const struct option aubinator_opts[] = {
+      { "help",       no_argument,       (int *) &help,                 true },
+      { "no-pager",   no_argument,       (int *) &pager,                false },
+      { "no-offsets", no_argument,       (int *) &option_print_offsets, false },
+      { "gen",        required_argument, NULL,                          'g' },
+      { "headers",    no_argument,       (int *) &option_full_decode,   false },
+      { "color",      required_argument, NULL,                          'c' },
+      { "xml",        required_argument, NULL,                          'x' },
+      { NULL,         0,                 NULL,                          0 }
+   };
+   struct gen_device_info devinfo;
 
-   if (argc == 1) {
-      print_help(argv[0], stderr);
-      exit(EXIT_FAILURE);
-   }
-
-   for (i = 1; i < argc; ++i) {
-      if (strcmp(argv[i], "--no-pager") == 0) {
-         pager = false;
-      } else if (strcmp(argv[i], "--no-offsets") == 0) {
-         option_print_offsets = false;
-      } else if (is_prefix(argv[i], "--gen", &value)) {
-         if (value == NULL) {
-            fprintf(stderr, "option '--gen' requires an argument\n");
-            exit(EXIT_FAILURE);
-         }
-         found_arg_gen = true;
-         snprintf(gen_val, sizeof(gen_val), "%s", value);
-      } else if (strcmp(argv[i], "--headers") == 0) {
-         option_full_decode = false;
-      } else if (is_prefix(argv[i], "--color", &value)) {
-         if (value == NULL || strcmp(value, "always") == 0)
+   i = 0;
+   while ((c = getopt_long(argc, argv, "", aubinator_opts, &i)) != -1) {
+      switch (c) {
+      case 'g':
+         snprintf(gen_val, sizeof(gen_val), "%s", optarg);
+         break;
+      case 'c':
+         if (optarg == NULL || strcmp(optarg, "always") == 0)
             option_color = COLOR_ALWAYS;
-         else if (strcmp(value, "never") == 0)
+         else if (strcmp(optarg, "never") == 0)
             option_color = COLOR_NEVER;
-         else if (strcmp(value, "auto") == 0)
+         else if (strcmp(optarg, "auto") == 0)
             option_color = COLOR_AUTO;
          else {
-            fprintf(stderr, "invalid value for --color: %s", value);
+            fprintf(stderr, "invalid value for --color: %s", optarg);
             exit(EXIT_FAILURE);
          }
-      } else if (strcmp(argv[i], "--help") == 0) {
-         print_help(argv[0], stdout);
-         exit(EXIT_SUCCESS);
-      } else {
-         if (argv[i][0] == '-') {
-            fprintf(stderr, "unknown option %s\n", argv[i]);
-            exit(EXIT_FAILURE);
-         }
-         input_file = argv[i];
+         break;
+      case 'x':
+         xml_path = strdup(optarg);
+         break;
+      default:
          break;
       }
    }
 
-   if (!found_arg_gen) {
-      fprintf(stderr, "argument --gen is required\n");
-      exit(EXIT_FAILURE);
+   if (help || argc == 1) {
+      print_help(argv[0], stderr);
+      exit(0);
    }
+
+   if (optind < argc)
+      input_file = argv[optind];
 
    for (i = 0; i < ARRAY_SIZE(gens); i++) {
       if (!strcmp(gen_val, gens[i].name)) {
@@ -1142,6 +1190,13 @@ int main(int argc, char *argv[])
       exit(EXIT_FAILURE);
    }
 
+   if (!gen_get_device_info(gen->pci_id, &devinfo)) {
+      fprintf(stderr, "can't find device information: pci_id=0x%x name=%s\n",
+              gen->pci_id, gen->name);
+      exit(EXIT_FAILURE);
+   }
+
+
    /* Do this before we redirect stdout to pager. */
    if (option_color == COLOR_AUTO)
       option_color = isatty(1) ? COLOR_ALWAYS : COLOR_NEVER;
@@ -1149,29 +1204,54 @@ int main(int argc, char *argv[])
    if (isatty(1) && pager)
       setup_pager();
 
-   if (gen->minor > 0) {
-      snprintf(gen_file, sizeof(gen_file), "../genxml/gen%d%d.xml",
-               gen->major, gen->minor);
-   } else {
-      snprintf(gen_file, sizeof(gen_file), "../genxml/gen%d.xml", gen->major);
-   }
-
-   spec = gen_spec_load(gen_file);
+   if (xml_path == NULL)
+      spec = gen_spec_load(&devinfo);
+   else
+      spec = gen_spec_load_from_path(&devinfo, xml_path);
    disasm = gen_disasm_create(gen->pci_id);
 
-   if (input_file == NULL) {
-       print_help(input_file, stderr);
-       exit(EXIT_FAILURE);
-   } else {
-       file = aub_file_open(input_file);
+   if (spec == NULL || disasm == NULL)
+      exit(EXIT_FAILURE);
+
+   if (input_file == NULL)
+      file = aub_file_stdin();
+   else
+      file = aub_file_open(input_file);
+
+   /* mmap a terabyte for our gtt space. */
+   gtt_size = 1ul << 40;
+   gtt = mmap(NULL, gtt_size, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS |  MAP_NORESERVE, -1, 0);
+   if (gtt == MAP_FAILED) {
+      fprintf(stderr, "failed to alloc gtt space: %s\n", strerror(errno));
+      exit(EXIT_FAILURE);
    }
 
-   while (aub_file_more_stuff(file))
-      aub_file_decode_batch(file, spec);
+   while (aub_file_more_stuff(file)) {
+      switch (aub_file_decode_batch(file, spec)) {
+      case AUB_ITEM_DECODE_OK:
+         break;
+      case AUB_ITEM_DECODE_NEED_MORE_DATA:
+         if (!file->stream) {
+            file->cursor = file->end;
+            break;
+         }
+         if (aub_file_more_stuff(file) && !aub_file_data_load(file)) {
+            fprintf(stderr, "failed to load data from stdin\n");
+            exit(EXIT_FAILURE);
+         }
+         break;
+      default:
+         fprintf(stderr, "failed to parse aubdump data\n");
+         exit(EXIT_FAILURE);
+      }
+   }
+
 
    fflush(stdout);
    /* close the stdout which is opened to write the output */
    close(1);
+   free(xml_path);
 
    wait(NULL);
 
