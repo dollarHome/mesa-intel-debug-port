@@ -1110,6 +1110,64 @@ print_help(const char *progname, FILE *file)
            progname);
 }
 
+static const struct {
+   int gen;
+   int pci_id;
+} gen_pciid[] = {
+   { .gen = 60, .pci_id = 0x0126 },
+   { .gen = 70, .pci_id = 0x0166 },
+   { .gen = 75, .pci_id = 0x0416 },
+   { .gen = 80, .pci_id = 0x1616 },
+   { .gen = 90, .pci_id = 0x0A84 }
+};
+
+static int 
+decode_from_bat(struct gen_device_info *devinfo, uint32_t *dword_data)
+{
+   int i = 0, pciid = 0, gen = devinfo_to_gen(devinfo);
+   struct gen_spec *spec;
+   bool pager = true;
+
+    /* Do this before we redirect stdout to pager. */
+   if (option_color == COLOR_AUTO)
+      option_color = isatty(1) ? COLOR_ALWAYS : COLOR_NEVER;
+
+   if (isatty(1) && pager)
+      setup_pager();
+
+   for (i = 0; i < ARRAY_SIZE(gen_pciid); i++) {
+      if (gen_pciid[i].gen == gen) {
+         pciid = gen_pciid[i].pci_id;
+         break;
+      }
+   }
+
+   spec = gen_spec_load(devinfo);
+   disasm = gen_disasm_create(pciid); 
+
+   if (spec == NULL || disasm == NULL)
+      exit(EXIT_FAILURE);
+
+   /* mmap a terabyte for our gtt space. */
+   gtt_size = 1ul << 40;
+   gtt = mmap(NULL, gtt_size, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS |  MAP_NORESERVE, -1, 0);
+   if (gtt == MAP_FAILED) {
+      fprintf(stderr, "failed to alloc gtt space: %s\n", strerror(errno));
+      exit(EXIT_FAILURE);
+   }
+
+   handle_trace_block(spec, dword_data);
+
+   fflush(stdout);
+   /* close the stdout which is opened to write the output */
+   close(1);
+
+   wait(NULL);
+
+   return EXIT_SUCCESS;
+}
+
 int main(int argc, char *argv[])
 {
    struct gen_spec *spec;

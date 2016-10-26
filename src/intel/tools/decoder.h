@@ -48,6 +48,17 @@ int gen_group_get_length(struct gen_group *group, const uint32_t *p);
 const char *gen_group_get_name(struct gen_group *group);
 uint32_t gen_group_get_opcode(struct gen_group *group);
 
+static int
+devinfo_to_gen(const struct gen_device_info *devinfo)
+{
+   int value = 10 * devinfo->gen;
+
+   if (devinfo->is_baytrail || devinfo->is_haswell)
+      value += 5;
+
+   return value;
+}
+
 struct gen_field_iterator {
    struct gen_group *group;
    const char *name;

@@ -135,41 +135,36 @@ intel_batchbuffer_require_space(struct brw_context *brw, GLuint sz,
 static void
 do_batch_dump(struct brw_context *brw)
 {
-   struct drm_intel_decode *decode;
+   //struct drm_intel_decode *decode;
    struct intel_batchbuffer *batch = &brw->batch;
-   int ret;
 
-   decode = drm_intel_decode_context_alloc(brw->screen->deviceID);
-   if (!decode)
-      return;
 
-   ret = drm_intel_bo_map(batch->bo, false);
-   if (ret == 0) {
-      drm_intel_decode_set_batch_pointer(decode,
-					 batch->bo->virtual,
-					 batch->bo->offset64,
-                                         USED_BATCH(*batch));
-   } else {
-      fprintf(stderr,
-	      "WARNING: failed to map batchbuffer (%s), "
-	      "dumping uploaded data instead.\n", strerror(ret));
+   uint32_t count =  USED_BATCH(*batch);
+   uint32_t *data;
+   unsigned int index = 0;
+   void *temp;
+   int size = count * 4;
 
-      drm_intel_decode_set_batch_pointer(decode,
-					 batch->map,
-					 batch->bo->offset64,
-                                         USED_BATCH(*batch));
-   }
+   temp = malloc(size);
+   memcpy(temp, batch->map, size);
+   data = temp;
+   struct gen_device_info *devinfo = &brw->screen->devinfo;
 
-   drm_intel_decode_set_output_file(decode, stderr);
-   drm_intel_decode(decode);
+   printf("count = %d, index=%d, size=%d, devinfo->gen=%d, \
+devinfo->is_haswell=%d\n", count, index, size, devinfo->gen, 
+devinfo->is_haswell);
 
-   drm_intel_decode_context_free(decode);
+   index = 0;
+   while (index < count) {
+      printf("count = %d, index = %d, Dword %d = 0x%08x\n", count, index, 
+index, data[index]);
 
-   if (ret == 0) {
-      drm_intel_bo_unmap(batch->bo);
+		index++;
+	}
 
-      brw_debug_batch(brw);
-   }
+	decode_from_bat(devinfo, data);
+	free(temp);
+   //brw_debug_batch(brw);
 }
 
 void

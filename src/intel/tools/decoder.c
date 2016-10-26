@@ -401,17 +401,6 @@ character_data(void *data, const XML_Char *s, int len)
 {
 }
 
-static int
-devinfo_to_gen(const struct gen_device_info *devinfo)
-{
-   int value = 10 * devinfo->gen;
-
-   if (devinfo->is_baytrail || devinfo->is_haswell)
-      value += 5;
-
-   return value;
-}
-
 static const struct {
    int gen;
    const uint8_t *data;
